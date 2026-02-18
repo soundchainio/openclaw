@@ -174,6 +174,10 @@ out to QMD for retrieval. Key points:
 **Config surface (`memory.qmd.*`)**
 
 - `command` (default `qmd`): override the executable path.
+- `mcporter` (optional but recommended for large GGUF models): route queries through [mcporter](https://github.com/steipete/mcporter) instead of spawning `qmd` per search. When enabled, QMD stays warm in a keep-alive MCP server, so searches avoid repeated model loads and stay within the default 4s timeout.
+  - `enabled` (default `false`): keep existing CLI behavior unless you explicitly opt in.
+  - `serverName` (default `"qmd"`): mcporter server entry that wraps `qmd mcp`.
+  - `startDaemon` (default `true` when `enabled`): run `mcporter daemon start` once per gateway process before issuing calls.
 - `searchMode` (default `search`): pick which QMD command backs
   `memory_search` (`search`, `vsearch`, `query`).
 - `includeDefaultMemory` (default `true`): auto-index `MEMORY.md` + `memory/**/*.md`.
@@ -217,6 +221,11 @@ memory: {
   backend: "qmd",
   citations: "auto",
   qmd: {
+    mcporter: {
+      enabled: true,
+      serverName: "qmd",
+      startDaemon: true,
+    },
     includeDefaultMemory: true,
     update: { interval: "5m", debounceMs: 15000 },
     limits: { maxResults: 6, timeoutMs: 4000 },
@@ -236,6 +245,28 @@ memory: {
   }
 }
 ```
+
+### Optional: mcporter keep-alive server
+
+OpenClaw does **not** bundle mcporter. If you use the QMD backend _and_ store sizeable embeddings (e.g., bundled GGUF models), enabling mcporter is the easiest way to avoid per-search cold-start penalties. Install mcporter separately and configure a server that keeps `qmd mcp` warm. Example `mcporter.config.mjs`:
+
+```js
+export default {
+  servers: {
+    qmd: {
+      command: "qmd",
+      args: ["mcp"],
+      lifecycle: "keep-alive",
+      env: {
+        XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+        XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+      },
+    },
+  },
+};
+```
+
+Start the daemon with `mcporter daemon start` (or let OpenClaw do it when `startDaemon = true`). When enabled, OpenClaw calls `mcporter call qmd.search` / `vector_search` / `deep_search` (matching `memory.qmd.searchMode`) and falls back to the CLI path if mcporter is disabled or missing.
 
 **Citations & fallback**
 
