@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ExecAllowlistEntry } from "./exec-approvals.js";
 import {
   DEFAULT_SAFE_BINS,
   analyzeShellCommand,
@@ -12,6 +11,7 @@ import {
   type CommandResolution,
   type ExecCommandSegment,
 } from "./exec-approvals-analysis.js";
+import type { ExecAllowlistEntry } from "./exec-approvals.js";
 
 const DEFAULT_SAFE_BIN_TRUSTED_DIRS = [
   "/bin",
