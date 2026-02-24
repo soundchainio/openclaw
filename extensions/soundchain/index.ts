@@ -5,6 +5,7 @@ import type {
   OpenClawPluginToolFactory,
 } from "../../src/plugins/types.js";
 import { createSoundChainApi, type SoundChainApi, type SoundChainConfig } from "./src/api.js";
+import { soundchainChannelPlugin } from "./src/channel.js";
 import {
   runPipeline,
   quickDiagnose,
@@ -439,6 +440,13 @@ const plugin = {
       }) as OpenClawPluginToolFactory,
       { optional: true },
     );
+
+    // --- SoundChain messaging channel ---
+    // Registers SoundChain as an OpenClaw messaging channel.
+    // Configure with channels.soundchain.apiToken in openclaw config.
+    // Enables: outbound DMs to SoundChain users, inbound message polling,
+    // and future cross-channel routing (WhatsApp/Telegram/Signal via OpenClaw).
+    api.registerChannel({ plugin: soundchainChannelPlugin });
   },
 };
 

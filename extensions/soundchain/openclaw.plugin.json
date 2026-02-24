@@ -1,7 +1,8 @@
 {
   "id": "soundchain",
   "name": "SoundChain",
-  "description": "Search music, play tracks, earn OGUN streaming rewards, and command the War Room — 7 Ollama models, fleet nodes, and SCid Worker.",
+  "channels": ["soundchain"],
+  "description": "Search music, play tracks, earn OGUN streaming rewards, send DMs via SoundChain messaging channel, and command the War Room — 7 Ollama models, fleet nodes, and SCid Worker.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
