@@ -7,6 +7,8 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolFactory,
 } from "../../src/plugins/types.js";
+import { runDiagnose, DIAGNOSE_STATUS } from "./src/diagnose.js";
+import { writeReport } from "./src/report-generator.js";
 import {
   BugStore,
   BUG_SEVERITY,
@@ -175,6 +177,61 @@ function createClearTool(): AnyAgentTool {
     async execute() {
       const removed = store.clear();
       return json({ cleared: removed, verdict: "CLEARED" });
+    },
+  };
+}
+
+function createDiagnoseTool(): AnyAgentTool {
+  return {
+    name: "agent_eye_diagnose",
+    label: "Agent Eye Diagnose",
+    description:
+      "Navigate to a URL and run a full diagnostic scan. Captures JS errors, console errors, " +
+      "network failures, DOM snapshot, and screenshot. Writes a structured report (JSON + Markdown) " +
+      "to ~/soundchain/reports/ and returns a summary. Use this for active bug hunting.",
+    parameters: Type.Object({
+      url: Type.String({ description: "URL to diagnose" }),
+      cdpUrl: Type.Optional(
+        Type.String({
+          description: "CDP URL for Chrome connection (default: http://127.0.0.1:9222)",
+        }),
+      ),
+      targetId: Type.Optional(
+        Type.String({ description: "Target ID of specific Chrome tab to use" }),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      const cdpUrl = params.cdpUrl ?? "http://127.0.0.1:9222";
+
+      // Set mode to WATCHING during diagnose
+      const prevMode = eyeMode;
+      eyeMode = EYE_MODE.WATCHING;
+
+      try {
+        const report = await runDiagnose(params.url as string, {
+          cdpUrl,
+          targetId: params.targetId as string | undefined,
+          store,
+        });
+
+        const paths = writeReport(report);
+
+        return json({
+          status: report.status,
+          overallSeverity: report.overallSeverity,
+          bugCount: report.bugs.length,
+          consoleMessageCount: report.consoleMessages.length,
+          networkFailureCount: report.networkFailures.length,
+          summary: report.summary,
+          durationMs: report.completedAt - report.startedAt,
+          reportJson: paths.jsonPath,
+          reportMd: paths.mdPath,
+          screenshot: paths.screenshotPath,
+          reportsDir: paths.dir,
+        });
+      } finally {
+        eyeMode = prevMode;
+      }
     },
   };
 }
@@ -350,6 +407,43 @@ function handleEyeCommand(args: string): { text: string } {
     return { text: `Cleared ${removed} bug(s) from buffer.` };
   }
 
+  if (sub === "diagnose") {
+    const url = args.trim().split(/\s+/).slice(1).join(" ").trim();
+    if (!url) {
+      return {
+        text: "Usage: /eye diagnose <url>\n\nRuns a full diagnostic scan — JS errors, console, network, DOM, screenshot.\nReport saved to ~/soundchain/reports/",
+      };
+    }
+
+    // Fire diagnose in background — reports written to disk
+    const cdpUrl = "http://127.0.0.1:9222";
+    const prevMode = eyeMode;
+    eyeMode = EYE_MODE.WATCHING;
+
+    runDiagnose(url, { cdpUrl, store })
+      .then((report) => {
+        const paths = writeReport(report);
+        eyeMode = prevMode;
+        // Report is on disk — Claude Code CLI can read it
+        console.log(
+          `[Agent EYE] Diagnose complete: ${report.status} | ${report.bugs.length} bugs | ${report.overallSeverity}\n` +
+            `  JSON: ${paths.jsonPath}\n` +
+            `  MD:   ${paths.mdPath}\n` +
+            (paths.screenshotPath ? `  IMG:  ${paths.screenshotPath}\n` : ""),
+        );
+      })
+      .catch((err) => {
+        eyeMode = prevMode;
+        console.error(
+          `[Agent EYE] Diagnose failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+
+    return {
+      text: `Diagnostic scan started for ${url}\nMode set to WATCHING\nResults will be saved to ~/soundchain/reports/\n\nUse agent_eye_diagnose tool for inline results, or wait for the report files.`,
+    };
+  }
+
   if (sub === "status" || sub === "") {
     const counts = store.counts();
     const countStr = BugStore.severityOrder()
@@ -367,11 +461,12 @@ function handleEyeCommand(args: string): { text: string } {
   return {
     text: [
       "Usage: /eye <subcommand>",
-      "  watch  — start capturing (WATCHING mode)",
-      "  sleep  — stop capturing (DORMANT mode)",
-      "  bugs   — list recent bugs",
-      "  clear  — clear bug buffer",
-      "  status — show mode and stats",
+      "  watch          — start capturing (WATCHING mode)",
+      "  sleep          — stop capturing (DORMANT mode)",
+      "  bugs           — list recent bugs",
+      "  clear          — clear bug buffer",
+      "  status         — show mode and stats",
+      "  diagnose <url> — full diagnostic scan (errors, console, network, DOM, screenshot)",
     ].join("\n"),
   };
 }
@@ -396,7 +491,7 @@ export default {
     // Tools
     const toolFactory: OpenClawPluginToolFactory = (ctx) => {
       if (ctx.sandboxed === undefined)
-        return [createBugsTool(), createStatusTool(), createClearTool()];
+        return [createBugsTool(), createStatusTool(), createClearTool(), createDiagnoseTool()];
       return null;
     };
     api.registerTool(toolFactory, { optional: true });
