@@ -7,6 +7,12 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolFactory,
 } from "../../src/plugins/types.js";
+import {
+  discoverChromeBridge,
+  formatBridgeStatus,
+  BRIDGE_STATUS,
+  BRIDGE_SOURCE,
+} from "./src/chrome-bridge.js";
 import { runDiagnose, DIAGNOSE_STATUS } from "./src/diagnose.js";
 import { writeReport } from "./src/report-generator.js";
 import {
@@ -186,9 +192,11 @@ function createDiagnoseTool(): AnyAgentTool {
     name: "agent_eye_diagnose",
     label: "Agent Eye Diagnose",
     description:
-      "Navigate to a URL and run a full diagnostic scan. Captures JS errors, console errors, " +
-      "network failures, DOM snapshot, and screenshot. Writes a structured report (JSON + Markdown) " +
-      "to ~/soundchain/reports/ and returns a summary. Use this for active bug hunting.",
+      "Navigate to a URL and run a full diagnostic scan via the Chrome co-worker bridge. " +
+      "Auto-discovers the OpenClaw Chrome extension relay (live tabs) or falls back to raw CDP. " +
+      "Captures JS errors, console errors, network failures, DOM snapshot, and screenshot. " +
+      "Writes a structured report (JSON + Markdown) to ~/soundchain/reports/. " +
+      "The full triangle: FURL xterm → Claude Code CLI → Chrome co-worker → diagnostic report.",
     parameters: Type.Object({
       url: Type.String({ description: "URL to diagnose" }),
       cdpUrl: Type.Optional(
@@ -201,7 +209,27 @@ function createDiagnoseTool(): AnyAgentTool {
       ),
     }),
     async execute(_toolCallId, params) {
-      const cdpUrl = params.cdpUrl ?? "http://127.0.0.1:9222";
+      // Auto-discover Chrome co-worker bridge if no cdpUrl provided
+      let cdpUrl = params.cdpUrl as string | undefined;
+      let targetId = params.targetId as string | undefined;
+      let bridgeSource = "manual";
+
+      if (!cdpUrl) {
+        const bridge = await discoverChromeBridge(params.url as string);
+        cdpUrl = bridge.cdpUrl;
+        targetId = targetId ?? bridge.targetId;
+        bridgeSource = bridge.source;
+
+        if (bridge.status === BRIDGE_STATUS.EXTENSION_MISSING) {
+          return json({
+            status: "BRIDGE_ERROR",
+            error:
+              "Chrome extension relay is running but no tab is attached. Open Chrome on MacBook and click the OpenClaw extension icon on a tab.",
+            bridgeStatus: bridge.status,
+            bridgeSource: bridge.source,
+          });
+        }
+      }
 
       // Set mode to WATCHING during diagnose
       const prevMode = eyeMode;
@@ -210,7 +238,7 @@ function createDiagnoseTool(): AnyAgentTool {
       try {
         const report = await runDiagnose(params.url as string, {
           cdpUrl,
-          targetId: params.targetId as string | undefined,
+          targetId,
           store,
         });
 
@@ -228,6 +256,8 @@ function createDiagnoseTool(): AnyAgentTool {
           reportMd: paths.mdPath,
           screenshot: paths.screenshotPath,
           reportsDir: paths.dir,
+          bridgeSource,
+          targetId,
         });
       } finally {
         eyeMode = prevMode;
@@ -407,26 +437,62 @@ function handleEyeCommand(args: string): { text: string } {
     return { text: `Cleared ${removed} bug(s) from buffer.` };
   }
 
+  if (sub === "bridge") {
+    // Async bridge check — fire and log
+    discoverChromeBridge()
+      .then((conn) => {
+        console.log(`[Agent EYE]\n${formatBridgeStatus(conn)}`);
+      })
+      .catch((err) => {
+        console.error(
+          `[Agent EYE] Bridge probe failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    return { text: "Probing Chrome co-worker bridge... check console for results." };
+  }
+
   if (sub === "diagnose") {
     const url = args.trim().split(/\s+/).slice(1).join(" ").trim();
     if (!url) {
       return {
-        text: "Usage: /eye diagnose <url>\n\nRuns a full diagnostic scan — JS errors, console, network, DOM, screenshot.\nReport saved to ~/soundchain/reports/",
+        text: "Usage: /eye diagnose <url>\n\nRuns a full diagnostic scan — JS errors, console, network, DOM, screenshot.\nAuto-discovers Chrome co-worker bridge (extension relay → raw CDP → fallback).\nReport saved to ~/soundchain/reports/",
       };
     }
 
-    // Fire diagnose in background — reports written to disk
-    const cdpUrl = "http://127.0.0.1:9222";
+    // Auto-discover Chrome co-worker bridge, then run diagnose
     const prevMode = eyeMode;
     eyeMode = EYE_MODE.WATCHING;
 
-    runDiagnose(url, { cdpUrl, store })
-      .then((report) => {
+    discoverChromeBridge(url)
+      .then(async (bridge) => {
+        const sourceLabel =
+          bridge.source === BRIDGE_SOURCE.CHROME_EXTENSION
+            ? "Chrome co-worker (live tab)"
+            : bridge.source === BRIDGE_SOURCE.RAW_CDP
+              ? "Raw CDP"
+              : "Fallback";
+
+        console.log(`[Agent EYE] Bridge: ${sourceLabel} @ ${bridge.cdpUrl}`);
+
+        if (bridge.status === BRIDGE_STATUS.EXTENSION_MISSING) {
+          eyeMode = prevMode;
+          console.log(
+            "[Agent EYE] Chrome extension relay running but no tab attached.\n" +
+              "Open Chrome on MacBook → click OpenClaw extension icon on the tab to control.",
+          );
+          return;
+        }
+
+        const report = await runDiagnose(url, {
+          cdpUrl: bridge.cdpUrl,
+          targetId: bridge.targetId,
+          store,
+        });
         const paths = writeReport(report);
         eyeMode = prevMode;
-        // Report is on disk — Claude Code CLI can read it
+
         console.log(
-          `[Agent EYE] Diagnose complete: ${report.status} | ${report.bugs.length} bugs | ${report.overallSeverity}\n` +
+          `[Agent EYE] Diagnose complete via ${sourceLabel}: ${report.status} | ${report.bugs.length} bugs | ${report.overallSeverity}\n` +
             `  JSON: ${paths.jsonPath}\n` +
             `  MD:   ${paths.mdPath}\n` +
             (paths.screenshotPath ? `  IMG:  ${paths.screenshotPath}\n` : ""),
@@ -440,7 +506,7 @@ function handleEyeCommand(args: string): { text: string } {
       });
 
     return {
-      text: `Diagnostic scan started for ${url}\nMode set to WATCHING\nResults will be saved to ~/soundchain/reports/\n\nUse agent_eye_diagnose tool for inline results, or wait for the report files.`,
+      text: `Diagnostic scan started for ${url}\nAuto-discovering Chrome co-worker bridge...\nMode set to WATCHING\nResults will be saved to ~/soundchain/reports/`,
     };
   }
 
@@ -466,7 +532,8 @@ function handleEyeCommand(args: string): { text: string } {
       "  bugs           — list recent bugs",
       "  clear          — clear bug buffer",
       "  status         — show mode and stats",
-      "  diagnose <url> — full diagnostic scan (errors, console, network, DOM, screenshot)",
+      "  diagnose <url> — full diagnostic scan via Chrome co-worker bridge",
+      "  bridge         — check Chrome co-worker connection status",
     ].join("\n"),
   };
 }
