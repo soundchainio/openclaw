@@ -110,14 +110,52 @@ const UNREAD_COUNT_QUERY = `
   }
 `;
 
+const EXPLORE_USERS_QUERY = `
+  query ExploreUsers($page: PageInput) {
+    exploreUsers(page: $page) {
+      nodes {
+        id
+        userHandle
+        displayName
+        isFollowed
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
+const FOLLOW_PROFILE_MUTATION = `
+  mutation FollowProfile($input: FollowProfileInput!) {
+    followProfile(input: $input) {
+      followedProfile {
+        id
+        userHandle
+        isFollowed
+      }
+    }
+  }
+`;
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
+
+export interface UserProfile {
+  id: string;
+  userHandle?: string;
+  displayName?: string;
+  isFollowed?: boolean;
+}
 
 export interface MessagingClient {
   getChats(): Promise<Chat[]>;
   sendMessage(toProfileId: string, message: string): Promise<ChatMessage>;
   getUnreadCount(): Promise<number>;
+  getAllUsers(): Promise<UserProfile[]>;
+  followUser(profileId: string): Promise<void>;
 }
 
 export function createMessagingClient(apiUrl: string, token: string): MessagingClient {
@@ -142,6 +180,39 @@ export function createMessagingClient(apiUrl: string, token: string): MessagingC
     async getUnreadCount(): Promise<number> {
       const data = await graphql(apiUrl, token, UNREAD_COUNT_QUERY);
       return (data.unreadMessageCount as number | undefined) ?? 0;
+    },
+
+    async getAllUsers(): Promise<UserProfile[]> {
+      const allUsers: UserProfile[] = [];
+      let cursor: string | null = null;
+      let hasNext = true;
+
+      while (hasNext) {
+        const page: Record<string, unknown> = { first: 50 };
+        if (cursor) page.after = cursor;
+
+        const data = await graphql(apiUrl, token, EXPLORE_USERS_QUERY, { page });
+        const connection = data.exploreUsers as
+          | {
+              nodes?: UserProfile[];
+              pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+            }
+          | undefined;
+
+        const nodes = connection?.nodes ?? [];
+        allUsers.push(...nodes);
+
+        hasNext = connection?.pageInfo?.hasNextPage ?? false;
+        cursor = connection?.pageInfo?.endCursor ?? null;
+      }
+
+      return allUsers;
+    },
+
+    async followUser(profileId: string): Promise<void> {
+      await graphql(apiUrl, token, FOLLOW_PROFILE_MUTATION, {
+        input: { followedId: profileId },
+      });
     },
   };
 }

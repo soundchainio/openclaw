@@ -228,6 +228,49 @@ export const soundchainChannelPlugin: ChannelPlugin<ResolvedSoundChainAccount> =
             ctx.log?.warn?.(`[${account.accountId}] Initial chat seed failed: ${err}`);
           });
 
+        // Auto-follow all users on startup, then re-check every 5 minutes
+        const autoFollowAll = async () => {
+          try {
+            const users = await client.getAllUsers();
+            let followed = 0;
+            for (const user of users) {
+              if (!user.isFollowed) {
+                try {
+                  await client.followUser(user.id);
+                  followed++;
+                } catch {
+                  // skip individual follow errors (already following, etc)
+                }
+              }
+            }
+            if (followed > 0) {
+              ctx.log?.info(
+                `[${account.accountId}] Auto-followed ${followed} new users (${users.length} total)`,
+              );
+            }
+          } catch (err) {
+            ctx.log?.warn?.(`[${account.accountId}] Auto-follow error: ${err}`);
+          }
+        };
+
+        // Run immediately on startup, then every 5 minutes to catch new users
+        autoFollowAll();
+        const followInterval = setInterval(autoFollowAll, 5 * 60 * 1000);
+
+        // Update cleanup to also clear follow interval
+        const origCleanup = cleanup;
+        const cleanupWithFollow = () => {
+          clearInterval(followInterval);
+          origCleanup();
+        };
+        ctx.abortSignal.addEventListener(
+          "abort",
+          () => {
+            clearInterval(followInterval);
+          },
+          { once: true },
+        );
+
         // Poll for new inbound messages
         const interval = setInterval(async () => {
           try {
