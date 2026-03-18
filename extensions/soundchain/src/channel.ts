@@ -3,11 +3,11 @@
  *
  * Turns SoundChain into an OpenClaw messaging channel. This means:
  * - OpenClaw agents can send DMs to SoundChain users via `sendText`
- * - Inbound messages are detected via 10s polling and logged
- * - Future: full inbound pipeline → OpenClaw agent responses
+ * - Inbound messages are detected via 3s polling
+ * - FURL replies via SMITH gateway (AI-powered, zero cost per user)
  *
  * Config (in openclaw config file under `channels.soundchain`):
- *   apiUrl:       GraphQL endpoint (default: https://api.soundchain.io/graphql)
+ *   apiUrl:       GraphQL endpoint (default: https://api.soundchain.io)
  *   apiToken:     JWT for the bot account (required)
  *   accountName:  Display name (default: "SoundChain")
  *
@@ -21,13 +21,14 @@
 
 import type { ChannelPlugin } from "openclaw/plugin-sdk";
 import { createMessagingClient, type MessagingClient } from "./messaging.js";
+import { generateReply } from "./responder.js";
 
 // ---------------------------------------------------------------------------
 // Account types
 // ---------------------------------------------------------------------------
 
 const DEFAULT_ACCOUNT_ID = "default";
-const POLL_INTERVAL_MS = 10_000;
+const POLL_INTERVAL_MS = 500;
 const MAX_SEEN_IDS = 5_000;
 
 export interface ResolvedSoundChainAccount {
@@ -61,7 +62,7 @@ function resolveAccount(
 ): ResolvedSoundChainAccount {
   const sc = extractChannelConfig(cfg);
   const apiUrl =
-    typeof sc.apiUrl === "string" && sc.apiUrl ? sc.apiUrl : "https://api.soundchain.io/graphql";
+    typeof sc.apiUrl === "string" && sc.apiUrl ? sc.apiUrl : "https://api.soundchain.io";
   const apiToken = typeof sc.apiToken === "string" ? sc.apiToken : "";
   const accountName =
     typeof sc.accountName === "string" && sc.accountName ? sc.accountName : "SoundChain";
@@ -171,89 +172,121 @@ export const soundchainChannelPlugin: ChannelPlugin<ResolvedSoundChainAccount> =
   // ---------------------------------------------------------------------------
 
   gateway: {
-    startAccount: async (ctx) => {
+    startAccount: (ctx) => {
       const account = ctx.account;
 
       if (!account.configured) {
         throw new Error("SoundChain API token not configured — set channels.soundchain.apiToken");
       }
 
-      ctx.log?.info(`[${account.accountId}] Starting SoundChain channel (${account.name})`);
+      // Return a long-running Promise that stays pending while the channel
+      // is active. The OpenClaw gateway auto-restarts channels whose
+      // startAccount Promise resolves — so we must block until aborted.
+      return new Promise<void>((resolve, reject) => {
+        ctx.log?.info(`[${account.accountId}] Starting SoundChain channel (${account.name})`);
 
-      // Create and store the messaging client
-      const client = createMessagingClient(account.apiUrl, account.apiToken);
-      activeClients.set(account.accountId, client);
+        // Create and store the messaging client
+        const client = createMessagingClient(account.apiUrl, account.apiToken);
+        activeClients.set(account.accountId, client);
 
-      // Track seen message IDs to avoid reprocessing
-      const seenIds = new Set<string>();
+        // Track last seen message timestamp per conversation.
+        // The chats query returns one entry per conversation (id = conversation ID),
+        // so we compare createdAt to detect new messages in existing conversations.
+        const lastSeen = new Map<string, string>();
 
-      // Seed with current messages so we don't replay history
-      try {
-        const chats = await client.getChats();
-        for (const chat of chats) {
-          if (chat.lastMessage?.id) {
-            seenIds.add(chat.lastMessage.id);
-          }
-        }
-        ctx.log?.debug?.(`[${account.accountId}] Seeded ${seenIds.size} existing message IDs`);
-      } catch (err) {
-        ctx.log?.warn?.(`[${account.accountId}] Initial chat seed failed: ${err}`);
-      }
-
-      // Poll for new inbound messages
-      const interval = setInterval(async () => {
-        try {
-          const chats = await client.getChats();
-
-          for (const chat of chats) {
-            const msg = chat.lastMessage;
-            if (!msg?.id || seenIds.has(msg.id)) continue;
-
-            seenIds.add(msg.id);
-
-            // Cap seen IDs to prevent unbounded growth
-            if (seenIds.size > MAX_SEEN_IDS) {
-              const entries = Array.from(seenIds);
-              for (let i = 0; i < entries.length - MAX_SEEN_IDS; i++) {
-                seenIds.delete(entries[i]);
-              }
-            }
-
-            const sender = chat.profile?.displayName ?? chat.profile?.handle ?? "unknown";
-            const preview = msg.message?.slice(0, 80) ?? "";
-
-            ctx.log?.info(
-              `[${account.accountId}] New DM from ${sender}: ${preview}${(msg.message?.length ?? 0) > 80 ? "..." : ""}`,
-            );
-
-            // Future: forward to OpenClaw message pipeline via
-            // runtime.channel.reply.handleInboundMessage({
-            //   channel: "soundchain",
-            //   accountId: account.accountId,
-            //   senderId: chat.profile?.id,
-            //   chatType: "direct",
-            //   chatId: chat.profile?.id,
-            //   text: msg.message,
-            //   reply: async (text) => { await client.sendMessage(chat.profile!.id, text); },
-            // });
-          }
-        } catch {
-          // Polling errors are non-fatal — gateway will retry on next interval
-        }
-      }, POLL_INTERVAL_MS);
-
-      ctx.log?.info(
-        `[${account.accountId}] SoundChain channel started — polling every ${POLL_INTERVAL_MS / 1000}s`,
-      );
-
-      // Return cleanup function (called by gateway on stop)
-      return {
-        stop: () => {
+        // Cleanup helper
+        const cleanup = () => {
           clearInterval(interval);
           activeClients.delete(account.accountId);
           ctx.log?.info(`[${account.accountId}] SoundChain channel stopped`);
-        },
-      };
+        };
+
+        // Listen for gateway abort signal (manual stop or shutdown)
+        ctx.abortSignal.addEventListener(
+          "abort",
+          () => {
+            cleanup();
+            resolve();
+          },
+          { once: true },
+        );
+
+        // Seed with current chat timestamps so we don't replay history
+        client
+          .getChats()
+          .then((chats) => {
+            for (const chat of chats) {
+              if (chat.id) {
+                lastSeen.set(chat.id, chat.createdAt ?? "");
+              }
+            }
+            ctx.log?.debug?.(
+              `[${account.accountId}] Seeded ${lastSeen.size} existing conversations`,
+            );
+          })
+          .catch((err) => {
+            ctx.log?.warn?.(`[${account.accountId}] Initial chat seed failed: ${err}`);
+          });
+
+        // Poll for new inbound messages
+        const interval = setInterval(async () => {
+          try {
+            const chats = await client.getChats();
+
+            for (const chat of chats) {
+              if (!chat.id) continue;
+
+              const prevTimestamp = lastSeen.get(chat.id);
+              const currentTimestamp = chat.createdAt ?? "";
+
+              // Update timestamp for this conversation
+              lastSeen.set(chat.id, currentTimestamp);
+
+              // Skip if we've already seen this exact message
+              if (prevTimestamp === currentTimestamp) continue;
+
+              // Skip read messages (only process unread)
+              if (!chat.unread) continue;
+
+              // Cap tracked conversations to prevent unbounded growth
+              if (lastSeen.size > MAX_SEEN_IDS) {
+                const entries = Array.from(lastSeen.keys());
+                for (let i = 0; i < entries.length - MAX_SEEN_IDS; i++) {
+                  lastSeen.delete(entries[i]);
+                }
+              }
+
+              const sender = chat.profile?.displayName ?? "unknown";
+              const preview = chat.message?.slice(0, 80) ?? "";
+
+              ctx.log?.info(
+                `[${account.accountId}] New DM from ${sender}: ${preview}${(chat.message?.length ?? 0) > 80 ? "..." : ""}`,
+              );
+
+              // Generate AI reply via SMITH gateway and send back
+              const profileId = chat.profile?.id;
+              if (profileId && chat.message) {
+                try {
+                  ctx.log?.info(`[${account.accountId}] Generating reply for ${sender}...`);
+                  const reply = await generateReply(sender, chat.message);
+                  await client.sendMessage(profileId, reply);
+                  ctx.log?.info(
+                    `[${account.accountId}] Replied to ${sender}: ${reply.slice(0, 80)}${reply.length > 80 ? "..." : ""}`,
+                  );
+                } catch (err) {
+                  ctx.log?.warn?.(`[${account.accountId}] Reply failed for ${sender}: ${err}`);
+                }
+              }
+            }
+          } catch (err) {
+            ctx.log?.warn?.(`[${account.accountId}] Poll error: ${err}`);
+          }
+        }, POLL_INTERVAL_MS);
+
+        ctx.log?.info(
+          `[${account.accountId}] SoundChain channel started — polling every ${POLL_INTERVAL_MS / 1000}s`,
+        );
+      });
     },
   },
 };

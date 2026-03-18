@@ -13,6 +13,7 @@ import {
   PIPELINE_STAGES,
   classifyError,
 } from "./src/phil-jackson.js";
+import { setSoundChainRuntime } from "./src/runtime.js";
 import {
   createWarRoomClient,
   type WarRoomClient,
@@ -355,6 +356,9 @@ const plugin = {
     "SoundChain War Room — Phil Jackson Triangle diagnostic pipeline (7 Ollama models), specialist agents, fleet nodes, music API + OGUN streaming rewards. Build. Diagnose. Ship.",
 
   register(api: OpenClawPluginApi) {
+    // Store runtime for inbound message forwarding (mirrors Nostr pattern)
+    setSoundChainRuntime(api.runtime);
+
     const cfg = (api.pluginConfig ?? {}) as Record<string, unknown>;
 
     // Music API config

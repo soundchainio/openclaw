@@ -17,20 +17,22 @@
 export interface ChatMessage {
   id: string;
   message: string;
+  fromId?: string;
+  toId?: string;
   createdAt: string;
-  from?: { id: string; displayName?: string };
-  to?: { id: string; displayName?: string };
+  fromProfile?: { id: string; displayName?: string; handle?: string };
 }
 
 export interface Chat {
   id: string;
+  message: string;
+  fromId?: string;
+  unread?: boolean;
+  createdAt: string;
   profile?: {
     id: string;
     displayName?: string;
-    handle?: string;
   };
-  lastMessage?: ChatMessage;
-  unreadMessageCount?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,30 +74,32 @@ async function graphql(
 
 const CHATS_QUERY = `
   query Chats {
-    chats {
-      id
-      profile {
-        id
-        displayName
-        handle
-      }
-      lastMessage {
+    chats(page: { first: 25 }) {
+      nodes {
         id
         message
+        fromId
+        unread
         createdAt
-        from { id }
+        profile {
+          id
+          displayName
+        }
       }
-      unreadMessageCount
     }
   }
 `;
 
 const SEND_MESSAGE_MUTATION = `
-  mutation SendMessage($toId: ID!, $message: String!) {
-    sendMessage(toId: $toId, message: $message) {
-      id
-      message
-      createdAt
+  mutation SendMessage($toId: String!, $message: String!) {
+    sendMessage(input: { toId: $toId, message: $message }) {
+      message {
+        id
+        fromId
+        toId
+        message
+        createdAt
+      }
     }
   }
 `;
@@ -120,7 +124,8 @@ export function createMessagingClient(apiUrl: string, token: string): MessagingC
   return {
     async getChats(): Promise<Chat[]> {
       const data = await graphql(apiUrl, token, CHATS_QUERY);
-      return (data.chats as Chat[] | undefined) ?? [];
+      const connection = data.chats as { nodes?: Chat[] } | undefined;
+      return connection?.nodes ?? [];
     },
 
     async sendMessage(toProfileId: string, message: string): Promise<ChatMessage> {
@@ -128,7 +133,8 @@ export function createMessagingClient(apiUrl: string, token: string): MessagingC
         toId: toProfileId,
         message,
       });
-      const result = data.sendMessage as ChatMessage | undefined;
+      const payload = data.sendMessage as { message?: ChatMessage } | undefined;
+      const result = payload?.message;
       if (!result) throw new Error("sendMessage returned null");
       return result;
     },
