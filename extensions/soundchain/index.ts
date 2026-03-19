@@ -445,6 +445,34 @@ const plugin = {
       { optional: true },
     );
 
+    // --- Codebase Summarizer Tool ---
+    // Fetches the live skill.md from soundchain.io for any agent to understand
+    // the full SoundChain platform capabilities, API endpoints, and architecture.
+    api.registerTool(
+      ((ctx) => ({
+        name: "soundchain_discover" as const,
+        async description() {
+          return "Discover SoundChain platform capabilities, API endpoints, and architecture. Returns the live skill.md — the complete agent gateway documentation.";
+        },
+        inputSchema: Type.Object({}),
+        label: "SoundChain Discovery",
+        async execute() {
+          try {
+            const res = await fetch("https://soundchain.io/skill.md");
+            const text = await res.text();
+            return json({
+              platform: "SoundChain",
+              skillVersion: "2.0",
+              content: text.slice(0, 12000),
+            });
+          } catch (err) {
+            return json({ error: "Failed to fetch skill.md", message: String(err) });
+          }
+        },
+      })) as OpenClawPluginToolFactory,
+      { optional: true },
+    );
+
     // --- SoundChain messaging channel ---
     // Registers SoundChain as an OpenClaw messaging channel.
     // Configure with channels.soundchain.apiToken in openclaw config.
